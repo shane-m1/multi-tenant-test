@@ -1,18 +1,103 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
     [string]$ClientId,
-
-    [Parameter(Mandatory = $true)]
     [string]$ClientSecret,
-
-    [Parameter(Mandatory = $true)]
     [string]$TenantCsvPath,
-
     [string]$OutputDirectory = "./tenant-exports",
-
     [string]$TenantIdColumn = "TenantId"
 )
+
+$scriptDirectory = Split-Path -Path $MyInvocation.MyCommand.Definition -Parent
+if (-not $scriptDirectory) {
+    $scriptDirectory = Get-Location
+}
+$envFilePath = Join-Path $scriptDirectory ".env"
+$knownOptionKeys = @("ClientId", "ClientSecret", "TenantCsvPath", "OutputDirectory", "TenantIdColumn")
+
+$envData = @{}
+if (Test-Path -Path $envFilePath) {
+    foreach ($line in Get-Content -Path $envFilePath) {
+        if ($line -match "^\s*(#|$)") {
+            continue
+        }
+
+        $pair = $line -split "=", 2
+        if ($pair.Count -eq 2) {
+            $key = $pair[0].Trim()
+            $value = $pair[1].Trim()
+
+            if ($key) {
+                $envData[$key] = $value
+            }
+        }
+    }
+}
+
+if (-not $ClientId -and $envData.ContainsKey("ClientId")) {
+    $ClientId = $envData["ClientId"]
+}
+
+if (-not $ClientSecret -and $envData.ContainsKey("ClientSecret")) {
+    $ClientSecret = $envData["ClientSecret"]
+}
+
+if (-not $TenantCsvPath -and $envData.ContainsKey("TenantCsvPath")) {
+    $TenantCsvPath = $envData["TenantCsvPath"]
+}
+
+if (-not $PSBoundParameters.ContainsKey("OutputDirectory") -and $envData.ContainsKey("OutputDirectory")) {
+    $OutputDirectory = $envData["OutputDirectory"]
+}
+
+if (-not $PSBoundParameters.ContainsKey("TenantIdColumn") -and $envData.ContainsKey("TenantIdColumn")) {
+    $TenantIdColumn = $envData["TenantIdColumn"]
+}
+
+$missing = @()
+if (-not $ClientId) {
+    $missing += "ClientId"
+}
+if (-not $ClientSecret) {
+    $missing += "ClientSecret"
+}
+if (-not $TenantCsvPath) {
+    $missing += "TenantCsvPath"
+}
+
+if ($missing.Count -gt 0) {
+    throw "Missing required settings: $($missing -join ', '). Provide them as parameters or via the .env file at $envFilePath."
+}
+
+$shouldPersistEnv = $false
+foreach ($key in $knownOptionKeys) {
+    if ($PSBoundParameters.ContainsKey($key)) {
+        $shouldPersistEnv = $true
+        break
+    }
+}
+
+if ($shouldPersistEnv) {
+    $persistData = @{}
+
+    foreach ($entry in $envData.GetEnumerator()) {
+        $persistData[$entry.Key] = $entry.Value
+    }
+
+    foreach ($key in $knownOptionKeys) {
+        if ($PSBoundParameters.ContainsKey($key)) {
+            $persistData[$key] = (Get-Variable -Name $key -ValueOnly)
+        }
+    }
+
+    $envContent = @()
+    foreach ($key in $knownOptionKeys) {
+        if ($persistData.ContainsKey($key)) {
+            $envContent += "$key=$($persistData[$key])"
+        }
+    }
+
+    Set-Content -Path $envFilePath -Value $envContent -Encoding UTF8
+}
 
 if (-not (Test-Path -Path $TenantCsvPath)) {
     throw "CSV file not found at $TenantCsvPath"
@@ -27,6 +112,7 @@ Import-Module Microsoft.Graph.Users -ErrorAction Stop
 Import-Module Microsoft.Graph.Groups -ErrorAction Stop
 Import-Module Microsoft.Graph.DirectoryObjects -ErrorAction Stop
 Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction Stop
+Import-Module Microsoft.Graph.Applications -ErrorAction Stop
 
 $tenants = Import-Csv -Path $TenantCsvPath
 
@@ -149,6 +235,8 @@ function Get-GraphPagedResult {
 $usersResults = @()
 $groupsResults = @()
 $roleResults = @()
+$servicePrincipalResults = @()
+$appPermissionResults = @()
 
 foreach ($tenant in $tenants) {
     if (-not $tenant.PSObject.Properties.Match($TenantIdColumn)) {
@@ -190,6 +278,83 @@ foreach ($tenant in $tenants) {
 
         $groupsResults += $tenantGroups
 
+        Write-Host "Retrieving service principals..." -ForegroundColor Yellow
+        $tenantServicePrincipalsRaw = Get-MgServicePrincipal -All -Property Id, AppId, DisplayName, ServicePrincipalType, AccountEnabled, AppOwnerOrganizationId, Tags
+
+        $servicePrincipalResults += $tenantServicePrincipalsRaw | Select-Object @{Name = "TenantId"; Expression = { $tenantId }},
+                                                                               Id,
+                                                                               AppId,
+                                                                               DisplayName,
+                                                                               ServicePrincipalType,
+                                                                               AccountEnabled,
+                                                                               AppOwnerOrganizationId,
+                                                                               @{Name = "Tags"; Expression = { $_.Tags -join ";" }}
+
+        Write-Host "Retrieving application permissions for service principals..." -ForegroundColor Yellow
+        $resourceAppRoleCache = @{}
+        $resourceDisplayNameCache = @{}
+        foreach ($sp in $tenantServicePrincipalsRaw) {
+            $appRoleAssignments = Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -All -ErrorAction SilentlyContinue
+
+            foreach ($assignment in $appRoleAssignments) {
+                $resourceDisplayName = $assignment.ResourceDisplayName
+                $appRoleDisplayName = $null
+                $appRoleValue = $null
+
+                if ($assignment.ResourceId) {
+                    $resourceIdKey = $assignment.ResourceId.ToString()
+
+                    if (-not $resourceAppRoleCache.ContainsKey($resourceIdKey)) {
+                        $resourceAppRoleCache[$resourceIdKey] = @{}
+                        $resourceSp = Get-MgServicePrincipal -ServicePrincipalId $assignment.ResourceId -Property AppRoles, DisplayName -ErrorAction SilentlyContinue
+
+                        if ($resourceSp) {
+                            $resourceDisplayNameCache[$resourceIdKey] = $resourceSp.DisplayName
+
+                            if ($resourceSp.AppRoles) {
+                                foreach ($role in $resourceSp.AppRoles) {
+                                    if ($role.Id) {
+                                        $resourceAppRoleCache[$resourceIdKey][$role.Id.ToString()] = @{
+                                            DisplayName = $role.DisplayName
+                                            Value       = $role.Value
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (-not $resourceDisplayName -and $resourceDisplayNameCache.ContainsKey($resourceIdKey)) {
+                        $resourceDisplayName = $resourceDisplayNameCache[$resourceIdKey]
+                    }
+
+                    if ($assignment.AppRoleId) {
+                        $roleKey = $assignment.AppRoleId.ToString()
+
+                        if ($resourceAppRoleCache.ContainsKey($resourceIdKey) -and
+                            $resourceAppRoleCache[$resourceIdKey].ContainsKey($roleKey)) {
+                            $roleInfo = $resourceAppRoleCache[$resourceIdKey][$roleKey]
+                            $appRoleDisplayName = $roleInfo.DisplayName
+                            $appRoleValue = $roleInfo.Value
+                        }
+                    }
+                }
+
+                $appPermissionResults += [pscustomobject]@{
+                    TenantId                      = $tenantId
+                    ServicePrincipalId            = $sp.Id
+                    ServicePrincipalAppId         = $sp.AppId
+                    ServicePrincipalDisplayName   = $sp.DisplayName
+                    ResourceId                    = $assignment.ResourceId
+                    ResourceDisplayName           = $resourceDisplayName
+                    AppRoleDisplayName            = $appRoleDisplayName
+                    AppRoleValue                  = $appRoleValue
+                    PrincipalId                   = $assignment.PrincipalId
+                    PrincipalType                 = $assignment.PrincipalType
+                }
+            }
+        }
+
         Write-Host "Retrieving role assignments..." -ForegroundColor Yellow
 
         $principalCache = @{}
@@ -220,11 +385,14 @@ foreach ($tenant in $tenants) {
 
         try {
             $roleDefinitions = @{}
-            $roleDefinitionData = Get-GraphPagedResult -Uri "https://graph.microsoft.com/beta/roleManagement/directory/roleDefinitions`?\$select=id,displayName"
+            $roleDefinitionData = Get-MgDirectoryRole -All -ErrorAction SilentlyContinue
 
             foreach ($definition in $roleDefinitionData) {
-                if ($definition.id -and -not $roleDefinitions.ContainsKey($definition.id)) {
-                    $roleDefinitions[$definition.id] = $definition.displayName
+                if ($definition.Id -and -not $roleDefinitions.ContainsKey($definition.Id)) {
+                    $roleDefinitions[$definition.Id] = $definition.DisplayName
+                }
+                if ($definition.RoleTemplateId -and -not $roleDefinitions.ContainsKey($definition.RoleTemplateId)) {
+                    $roleDefinitions[$definition.RoleTemplateId] = $definition.DisplayName
                 }
             }
 
@@ -283,6 +451,24 @@ if ($groupsResults.Count -gt 0) {
 }
 else {
     Write-Host "No group data collected." -ForegroundColor Yellow
+}
+
+if ($servicePrincipalResults.Count -gt 0) {
+    $servicePrincipalExportPath = Join-Path $OutputDirectory "AllTenants-ServicePrincipals.csv"
+    $servicePrincipalResults | Export-Csv -Path $servicePrincipalExportPath -NoTypeInformation
+    Write-Host "Service principal export written to $servicePrincipalExportPath" -ForegroundColor Green
+}
+else {
+    Write-Host "No service principal data collected." -ForegroundColor Yellow
+}
+
+if ($appPermissionResults.Count -gt 0) {
+    $appPermissionsExportPath = Join-Path $OutputDirectory "AllTenants-ServicePrincipalAppPermissions.csv"
+    $appPermissionResults | Export-Csv -Path $appPermissionsExportPath -NoTypeInformation
+    Write-Host "Service principal application permissions export written to $appPermissionsExportPath" -ForegroundColor Green
+}
+else {
+    Write-Host "No service principal application permissions collected." -ForegroundColor Yellow
 }
 
 if ($roleResults.Count -gt 0) {
