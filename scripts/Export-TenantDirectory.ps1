@@ -5,7 +5,7 @@ param(
     [string]$TenantCsvPath,
     [string]$OutputDirectory = "./tenant-exports",
     [string]$TenantIdColumn = "TenantId",
-    [string[]]$Exports = @("All")
+    [string[]]$Retrieve = @("Users", "Groups", "ServicePrincipals", "AppPermissions", "Roles", "Applications")
 )
 
 $scriptDirectory = Split-Path -Path $MyInvocation.MyCommand.Definition -Parent
@@ -13,7 +13,7 @@ if (-not $scriptDirectory) {
     $scriptDirectory = Get-Location
 }
 $envFilePath = Join-Path $scriptDirectory ".env"
-$knownOptionKeys = @("ClientId", "ClientSecret", "TenantCsvPath", "OutputDirectory", "TenantIdColumn", "Exports")
+$knownOptionKeys = @("ClientId", "ClientSecret", "TenantCsvPath", "OutputDirectory", "TenantIdColumn", "Retrieve")
 
 $envData = @{}
 if (Test-Path -Path $envFilePath) {
@@ -54,8 +54,8 @@ if (-not $PSBoundParameters.ContainsKey("TenantIdColumn") -and $envData.Contains
     $TenantIdColumn = $envData["TenantIdColumn"]
 }
 
-if (-not $PSBoundParameters.ContainsKey("Exports") -and $envData.ContainsKey("Exports")) {
-    $Exports = $envData["Exports"] -split ",", [System.StringSplitOptions]::RemoveEmptyEntries
+if (-not $PSBoundParameters.ContainsKey("Retrieve") -and $envData.ContainsKey("Retrieve")) {
+    $Retrieve = $envData["Retrieve"] -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 }
 
 $missing = @()
@@ -97,18 +97,12 @@ if ($shouldPersistEnv) {
     $envContent = @()
     foreach ($key in $knownOptionKeys) {
         if ($persistData.ContainsKey($key)) {
-            $value = $persistData[$key]
-
-            if ($key -eq "Exports" -and $value) {
-                if ($value -is [array]) {
-                    $value = ($value -join ",")
-                }
-                else {
-                    $value = $value.ToString()
-                }
+            $valueToPersist = $persistData[$key]
+            if ($valueToPersist -is [System.Array]) {
+                $valueToPersist = $valueToPersist -join ","
             }
 
-            $envContent += "$key=$value"
+            $envContent += "$key=$valueToPersist"
         }
     }
 
@@ -129,44 +123,25 @@ Import-Module Microsoft.Graph.Groups -ErrorAction Stop
 Import-Module Microsoft.Graph.DirectoryObjects -ErrorAction Stop
 Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction Stop
 Import-Module Microsoft.Graph.Applications -ErrorAction Stop
-Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
 
-$validExports = @("users", "groups", "serviceprincipals", "apppermissions", "roles", "securitydefaults", "all")
-$normalizedExports = @()
-if ($Exports) {
-    foreach ($item in $Exports) {
-        if (-not [string]::IsNullOrWhiteSpace($item)) {
-            $normalizedExports += $item.Trim().ToLowerInvariant()
-        }
+# Normalize retrieval selection (default is all).
+$retrieveSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($item in $Retrieve) {
+    if ([string]::IsNullOrWhiteSpace($item)) { continue }
+    $trimmed = $item.Trim()
+    if ($trimmed -ieq "AppRegistrations" -or $trimmed -ieq "Apps") {
+        $trimmed = "Applications"
     }
+
+    [void]$retrieveSet.Add($trimmed)
 }
 
-if (-not $normalizedExports) {
-    $normalizedExports = @("all")
-}
-
-$invalidExports = $normalizedExports | Where-Object { $validExports -notcontains $_ }
-if ($invalidExports) {
-    throw "Invalid export types specified: $($invalidExports -join ', '). Valid values are: $($validExports -join ', ')."
-}
-
-if ($normalizedExports -contains "all") {
-    $normalizedExports = $validExports | Where-Object { $_ -ne "all" }
-}
-
-$exportSelection = @{}
-foreach ($exp in $normalizedExports) {
-    $exportSelection[$exp] = $true
-}
-
-function ShouldExport {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    return $exportSelection.ContainsKey($Name.ToLowerInvariant())
-}
+$retrieveUsers = $retrieveSet.Count -eq 0 -or $retrieveSet.Contains("Users")
+$retrieveGroups = $retrieveSet.Count -eq 0 -or $retrieveSet.Contains("Groups")
+$retrieveAppPermissions = $retrieveSet.Count -eq 0 -or $retrieveSet.Contains("AppPermissions")
+$retrieveServicePrincipals = $retrieveSet.Count -eq 0 -or $retrieveSet.Contains("ServicePrincipals") -or $retrieveAppPermissions
+$retrieveRoles = $retrieveSet.Count -eq 0 -or $retrieveSet.Contains("Roles")
+$retrieveApplications = $retrieveSet.Count -eq 0 -or $retrieveSet.Contains("Applications")
 
 $tenants = Import-Csv -Path $TenantCsvPath
 
@@ -202,6 +177,20 @@ function Connect-Tenant {
             throw
         }
     }
+
+    if (-not ("Azure.Identity.ClientSecretCredential" -as [Type])) {
+        try {
+            Add-Type -AssemblyName "Azure.Identity" -ErrorAction Stop
+        }
+        catch {
+            throw "Failed to load Azure.Identity assembly required for ClientSecretCredential. $($_.Exception.Message)"
+        }
+    }
+
+
+    Connect-MgGraph -ClientSecretCredential $appCredential `
+                    -NoWelcome `
+                    -ErrorAction Stop | Out-Null
 }
 
 function Resolve-Principal {
@@ -277,7 +266,7 @@ $groupsResults = @()
 $roleResults = @()
 $servicePrincipalResults = @()
 $appPermissionResults = @()
-$securityDefaultsResults = @()
+$applicationOwnerResults = @()
 
 foreach ($tenant in $tenants) {
     if (-not $tenant.PSObject.Properties.Match($TenantIdColumn)) {
@@ -296,20 +285,28 @@ foreach ($tenant in $tenants) {
     try {
         Connect-Tenant -TenantId $tenantId
 
-        if (ShouldExport "users") {
+        if ($retrieveUsers) {
             Write-Host "Retrieving users..." -ForegroundColor Yellow
-            $tenantUsers = Get-MgUser -All -Property Id, DisplayName, UserPrincipalName, Mail, AccountEnabled |
+            $tenantUsers = Get-MgUser -All -Property Id, DisplayName, UserPrincipalName, Mail, AccountEnabled, UserType, ExternalUserState |
                 Select-Object @{Name = "TenantId"; Expression = { $tenantId }},
                               Id,
                               DisplayName,
                               UserPrincipalName,
                               Mail,
-                              AccountEnabled
+                              AccountEnabled,
+                              UserType,
+                              ExternalUserState,
+                              @{Name = "GuestInviteAccepted"; Expression = {
+                                  if ($_.UserType -eq "Guest" -and $_.ExternalUserState) {
+                                      return $_.ExternalUserState -eq "Accepted"
+                                  }
+                                  return $null
+                              }}
 
             $usersResults += $tenantUsers
         }
 
-        if (ShouldExport "groups") {
+        if ($retrieveGroups) {
             Write-Host "Retrieving groups..." -ForegroundColor Yellow
             $tenantGroups = Get-MgGroup -All -Property Id, DisplayName, Mail, MailEnabled, SecurityEnabled, GroupTypes |
                 Select-Object @{Name = "TenantId"; Expression = { $tenantId }},
@@ -323,13 +320,84 @@ foreach ($tenant in $tenants) {
             $groupsResults += $tenantGroups
         }
 
-        $shouldRetrieveServicePrincipals = (ShouldExport "serviceprincipals") -or (ShouldExport "apppermissions")
+        if ($retrieveApplications) {
+            Write-Host "Retrieving application registrations..." -ForegroundColor Yellow
+            $tenantApplications = Get-MgApplication -All -Property Id, AppId, DisplayName, SignInAudience, VerifiedPublisher
+
+            foreach ($app in $tenantApplications) {
+                $owners = Get-MgApplicationOwner -ApplicationId $app.Id -All -ErrorAction SilentlyContinue
+
+                foreach ($owner in $owners) {
+                    $ownerType = $owner.AdditionalProperties['@odata.type']
+                    $ownerDisplayName = $owner.AdditionalProperties['displayName']
+                    $ownerUpn = $owner.AdditionalProperties['userPrincipalName']
+                    $ownerMail = $owner.AdditionalProperties['mail']
+                    $ownerId = $owner.Id
+
+                    if (-not $ownerDisplayName -and $owner.AdditionalProperties['appDisplayName']) {
+                        $ownerDisplayName = $owner.AdditionalProperties['appDisplayName']
+                    }
+
+                    $verifiedPublisherId = $app.VerifiedPublisher.VerifiedPublisherId
+                    $verifiedPublisherDisplayName = $app.VerifiedPublisher.DisplayName
+                    $applicationOwnerResults += [pscustomobject]@{
+                        TenantId                 = $tenantId
+                        ApplicationObjectId      = $app.Id
+                        ApplicationAppId         = $app.AppId
+                        ApplicationDisplayName   = $app.DisplayName
+                        ApplicationSignInAudience = $app.SignInAudience
+                        ApplicationVerifiedPublisherId = $verifiedPublisherId
+                        ApplicationVerifiedPublisherDisplayName = $verifiedPublisherDisplayName
+                        ApplicationHasVerifiedPublisher = [bool]$verifiedPublisherId
+                        OwnerId                  = $ownerId
+                        OwnerDisplayName         = $ownerDisplayName
+                        OwnerUserPrincipalName   = $ownerUpn
+                        OwnerMail                = $ownerMail
+                        OwnerType                = $ownerType
+                        MembershipSource         = "DirectOwner"
+                        OwningGroupId            = $null
+                        OwningGroupDisplayName   = $null
+                    }
+
+                    if ($ownerType -and $ownerType -like "*group*") {
+                        $groupMembers = Get-MgGroupTransitiveMember -GroupId $ownerId -All -Property Id, DisplayName, UserPrincipalName, Mail, "@odata.type"
+
+                        foreach ($member in $groupMembers) {
+                            $memberType = $member.AdditionalProperties['@odata.type']
+                            $memberDisplayName = $member.AdditionalProperties['displayName']
+                            $memberUpn = $member.AdditionalProperties['userPrincipalName']
+                            $memberMail = $member.AdditionalProperties['mail']
+
+                            $applicationOwnerResults += [pscustomobject]@{
+                                TenantId                 = $tenantId
+                                ApplicationObjectId      = $app.Id
+                                ApplicationAppId         = $app.AppId
+                                ApplicationDisplayName   = $app.DisplayName
+                                ApplicationSignInAudience = $app.SignInAudience
+                                ApplicationVerifiedPublisherId = $verifiedPublisherId
+                                ApplicationVerifiedPublisherDisplayName = $verifiedPublisherDisplayName
+                                ApplicationHasVerifiedPublisher = [bool]$verifiedPublisherId
+                                OwnerId                  = $member.Id
+                                OwnerDisplayName         = $memberDisplayName
+                                OwnerUserPrincipalName   = $memberUpn
+                                OwnerMail                = $memberMail
+                                OwnerType                = $memberType
+                                MembershipSource         = "GroupMemberOfOwnerGroup"
+                                OwningGroupId            = $ownerId
+                                OwningGroupDisplayName   = $ownerDisplayName
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         $tenantServicePrincipalsRaw = @()
-        if ($shouldRetrieveServicePrincipals) {
+        if ($retrieveServicePrincipals) {
             Write-Host "Retrieving service principals..." -ForegroundColor Yellow
             $tenantServicePrincipalsRaw = Get-MgServicePrincipal -All -Property Id, AppId, DisplayName, ServicePrincipalType, AccountEnabled, AppOwnerOrganizationId, Tags
 
-            if (ShouldExport "serviceprincipals") {
+            if ($retrieveSet.Contains("ServicePrincipals") -or $retrieveSet.Count -eq 0) {
                 $servicePrincipalResults += $tenantServicePrincipalsRaw | Select-Object @{Name = "TenantId"; Expression = { $tenantId }},
                                                                                        Id,
                                                                                        AppId,
@@ -341,7 +409,7 @@ foreach ($tenant in $tenants) {
             }
         }
 
-        if ((ShouldExport "apppermissions") -and $tenantServicePrincipalsRaw) {
+        if ($retrieveAppPermissions -and $tenantServicePrincipalsRaw.Count -gt 0) {
             Write-Host "Retrieving application permissions for service principals..." -ForegroundColor Yellow
             $resourceAppRoleCache = @{}
             $resourceDisplayNameCache = @{}
@@ -408,7 +476,7 @@ foreach ($tenant in $tenants) {
             }
         }
 
-        if (ShouldExport "roles") {
+        if ($retrieveRoles) {
             Write-Host "Retrieving role assignments..." -ForegroundColor Yellow
 
             $principalCache = @{}
@@ -425,12 +493,12 @@ foreach ($tenant in $tenants) {
                                                           -FallbackType $member.AdditionalProperties['@odata.type']
 
                         $roleResults += [pscustomobject]@{
-                            TenantId             = $tenantId
-                            AssignmentType       = "Active"
-                            RoleId               = $role.Id
-                            RoleDisplayName      = $role.DisplayName
-                            PrincipalId          = $member.Id
-                            PrincipalType        = $principalInfo.ObjectType
+                            TenantId            = $tenantId
+                            AssignmentType      = "Active"
+                            RoleId              = $role.Id
+                            RoleDisplayName     = $role.DisplayName
+                            PrincipalId         = $member.Id
+                            PrincipalType       = $principalInfo.ObjectType
                             PrincipalDisplayName = $principalInfo.DisplayName
                         }
                     }
@@ -480,20 +548,6 @@ foreach ($tenant in $tenants) {
             }
         }
 
-        if (ShouldExport "securitydefaults") {
-            Write-Host "Retrieving security defaults configuration..." -ForegroundColor Yellow
-            try {
-                $securityDefaultsPolicy = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/policies/identitySecurityDefaultsEnforcementPolicy" -OutputType PSObject -ErrorAction Stop
-                $securityDefaultsResults += [pscustomobject]@{
-                    TenantId                 = $tenantId
-                    SecurityDefaultsEnabled  = $securityDefaultsPolicy.isEnabled
-                }
-            }
-            catch {
-                Write-Warning "Failed to retrieve security defaults for tenant $tenantId. $($_.Exception.Message)"
-            }
-        }
-
         Write-Host "Tenant $tenantId complete." -ForegroundColor Green
     }
     catch {
@@ -504,7 +558,7 @@ foreach ($tenant in $tenants) {
     }
 }
 
-if (ShouldExport "users") {
+if ($retrieveUsers) {
     if ($usersResults.Count -gt 0) {
         $userExportPath = Join-Path $OutputDirectory "AllTenants-Users.csv"
         $usersResults | Export-Csv -Path $userExportPath -NoTypeInformation
@@ -515,10 +569,10 @@ if (ShouldExport "users") {
     }
 }
 else {
-    Write-Host "User export skipped (not selected)." -ForegroundColor Yellow
+    Write-Host "User export skipped (not requested)." -ForegroundColor Yellow
 }
 
-if (ShouldExport "groups") {
+if ($retrieveGroups) {
     if ($groupsResults.Count -gt 0) {
         $groupExportPath = Join-Path $OutputDirectory "AllTenants-Groups.csv"
         $groupsResults | Export-Csv -Path $groupExportPath -NoTypeInformation
@@ -529,10 +583,10 @@ if (ShouldExport "groups") {
     }
 }
 else {
-    Write-Host "Group export skipped (not selected)." -ForegroundColor Yellow
+    Write-Host "Group export skipped (not requested)." -ForegroundColor Yellow
 }
 
-if (ShouldExport "serviceprincipals") {
+if ($retrieveSet.Contains("ServicePrincipals") -or $retrieveSet.Count -eq 0) {
     if ($servicePrincipalResults.Count -gt 0) {
         $servicePrincipalExportPath = Join-Path $OutputDirectory "AllTenants-ServicePrincipals.csv"
         $servicePrincipalResults | Export-Csv -Path $servicePrincipalExportPath -NoTypeInformation
@@ -543,10 +597,10 @@ if (ShouldExport "serviceprincipals") {
     }
 }
 else {
-    Write-Host "Service principal export skipped (not selected)." -ForegroundColor Yellow
+    Write-Host "Service principal export skipped (not requested)." -ForegroundColor Yellow
 }
 
-if (ShouldExport "apppermissions") {
+if ($retrieveAppPermissions) {
     if ($appPermissionResults.Count -gt 0) {
         $appPermissionsExportPath = Join-Path $OutputDirectory "AllTenants-ServicePrincipalAppPermissions.csv"
         $appPermissionResults | Export-Csv -Path $appPermissionsExportPath -NoTypeInformation
@@ -557,10 +611,10 @@ if (ShouldExport "apppermissions") {
     }
 }
 else {
-    Write-Host "Service principal application permissions export skipped (not selected)." -ForegroundColor Yellow
+    Write-Host "Service principal application permissions export skipped (not requested)." -ForegroundColor Yellow
 }
 
-if (ShouldExport "roles") {
+if ($retrieveRoles) {
     if ($roleResults.Count -gt 0) {
         $roleExportPath = Join-Path $OutputDirectory "AllTenants-Roles.csv"
         $roleResults | Export-Csv -Path $roleExportPath -NoTypeInformation
@@ -571,19 +625,19 @@ if (ShouldExport "roles") {
     }
 }
 else {
-    Write-Host "Role export skipped (not selected)." -ForegroundColor Yellow
+    Write-Host "Role export skipped (not requested)." -ForegroundColor Yellow
 }
 
-if (ShouldExport "securitydefaults") {
-    if ($securityDefaultsResults.Count -gt 0) {
-        $securityDefaultsExportPath = Join-Path $OutputDirectory "AllTenants-SecurityDefaults.csv"
-        $securityDefaultsResults | Export-Csv -Path $securityDefaultsExportPath -NoTypeInformation
-        Write-Host "Security defaults export written to $securityDefaultsExportPath" -ForegroundColor Green
+if ($retrieveApplications) {
+    if ($applicationOwnerResults.Count -gt 0) {
+        $applicationExportPath = Join-Path $OutputDirectory "AllTenants-AppRegistrations.csv"
+        $applicationOwnerResults | Export-Csv -Path $applicationExportPath -NoTypeInformation
+        Write-Host "Application registration export written to $applicationExportPath" -ForegroundColor Green
     }
     else {
-        Write-Host "No security defaults data collected." -ForegroundColor Yellow
+        Write-Host "No application registration data collected." -ForegroundColor Yellow
     }
 }
 else {
-    Write-Host "Security defaults export skipped (not selected)." -ForegroundColor Yellow
+    Write-Host "Application registration export skipped (not requested)." -ForegroundColor Yellow
 }
