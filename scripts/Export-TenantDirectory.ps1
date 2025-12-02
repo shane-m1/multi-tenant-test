@@ -5,7 +5,7 @@ param(
     [string]$TenantCsvPath,
     [string]$OutputDirectory = "./tenant-exports",
     [string]$TenantIdColumn = "TenantId",
-    [string[]]$Retrieve = @("Users", "Groups", "ServicePrincipals", "AppPermissions", "Roles", "Applications")
+    [string[]]$Retrieve = @("Users", "Groups", "ServicePrincipals", "AppPermissions", "Roles", "Applications", "UserAuthMethods")
 )
 
 $scriptDirectory = Split-Path -Path $MyInvocation.MyCommand.Definition -Parent
@@ -132,6 +132,9 @@ foreach ($item in $Retrieve) {
     if ($trimmed -ieq "AppRegistrations" -or $trimmed -ieq "Apps") {
         $trimmed = "Applications"
     }
+    elseif ($trimmed -ieq "AuthMethods" -or $trimmed -ieq "UserAuthenticationMethods") {
+        $trimmed = "UserAuthMethods"
+    }
 
     [void]$retrieveSet.Add($trimmed)
 }
@@ -142,6 +145,7 @@ $retrieveAppPermissions = $retrieveSet.Count -eq 0 -or $retrieveSet.Contains("Ap
 $retrieveServicePrincipals = $retrieveSet.Count -eq 0 -or $retrieveSet.Contains("ServicePrincipals") -or $retrieveAppPermissions
 $retrieveRoles = $retrieveSet.Count -eq 0 -or $retrieveSet.Contains("Roles")
 $retrieveApplications = $retrieveSet.Count -eq 0 -or $retrieveSet.Contains("Applications")
+$retrieveUserAuthMethods = $retrieveSet.Count -eq 0 -or $retrieveSet.Contains("UserAuthMethods")
 
 $tenants = Import-Csv -Path $TenantCsvPath
 
@@ -267,6 +271,7 @@ $roleResults = @()
 $servicePrincipalResults = @()
 $appPermissionResults = @()
 $applicationOwnerResults = @()
+$userAuthMethodResults = @()
 
 foreach ($tenant in $tenants) {
     if (-not $tenant.PSObject.Properties.Match($TenantIdColumn)) {
@@ -285,7 +290,8 @@ foreach ($tenant in $tenants) {
     try {
         Connect-Tenant -TenantId $tenantId
 
-        if ($retrieveUsers) {
+        $tenantUsers = @()
+        if ($retrieveUsers -or $retrieveUserAuthMethods) {
             Write-Host "Retrieving users..." -ForegroundColor Yellow
             $tenantUsers = Get-MgUser -All -Property Id, DisplayName, UserPrincipalName, Mail, AccountEnabled, UserType, ExternalUserState |
                 Select-Object @{Name = "TenantId"; Expression = { $tenantId }},
@@ -303,7 +309,72 @@ foreach ($tenant in $tenants) {
                                   return $null
                               }}
 
-            $usersResults += $tenantUsers
+            if ($retrieveUsers) {
+                $usersResults += $tenantUsers
+            }
+        }
+
+        if ($retrieveUserAuthMethods -and $tenantUsers.Count -gt 0) {
+            Write-Host "Retrieving user authentication methods..." -ForegroundColor Yellow
+
+            foreach ($user in $tenantUsers) {
+                $userIdEncoded = [uri]::EscapeDataString($user.Id)
+                $methodsUri = "https://graph.microsoft.com/v1.0/users/$userIdEncoded/authentication/methods"
+                try {
+                    $userMethods = Get-GraphPagedResult -Uri $methodsUri
+                }
+                catch {
+                    Write-Warning "Failed to retrieve authentication methods for user $($user.UserPrincipalName) in tenant $tenantId. $($_.Exception.Message)"
+                    continue
+                }
+
+                foreach ($method in $userMethods) {
+                    $additional = $method.AdditionalProperties
+                    $methodType = $method.'@odata.type'
+                    if (-not $methodType -and $additional) { $methodType = $additional['@odata.type'] }
+
+                    $phoneNumber = $method.phoneNumber
+                    if (-not $phoneNumber -and $additional) { $phoneNumber = $additional['phoneNumber'] }
+
+                    $phoneType = $method.phoneType
+                    if (-not $phoneType -and $additional) { $phoneType = $additional['phoneType'] }
+
+                    $emailAddress = $method.emailAddress
+                    if (-not $emailAddress -and $additional) { $emailAddress = $additional['emailAddress'] }
+
+                    $displayName = $method.displayName
+                    if (-not $displayName -and $additional) { $displayName = $additional['displayName'] }
+
+                    $deviceTag = $method.deviceTag
+                    if (-not $deviceTag -and $additional) { $deviceTag = $additional['deviceTag'] }
+
+                    $keyId = $method.keyId
+                    if (-not $keyId -and $additional) { $keyId = $additional['keyId'] }
+
+                    $state = $method.state
+                    if (-not $state -and $additional) { $state = $additional['state'] }
+
+                    $creationDateTime = $method.creationDateTime
+                    if (-not $creationDateTime -and $additional) { $creationDateTime = $additional['creationDateTime'] }
+
+                    $userAuthMethodResults += [pscustomobject]@{
+                        TenantId           = $tenantId
+                        UserId             = $user.Id
+                        UserPrincipalName  = $user.UserPrincipalName
+                        UserDisplayName    = $user.DisplayName
+                        MethodId           = $method.Id
+                        MethodType         = $methodType
+                        PhoneNumber        = $phoneNumber
+                        PhoneType          = $phoneType
+                        EmailAddress       = $emailAddress
+                        DeviceTag          = $deviceTag
+                        DisplayName        = $displayName
+                        KeyId              = $keyId
+                        State              = $state
+                        CreationDateTime   = $creationDateTime
+                    }
+                }
+            }
         }
 
         if ($retrieveGroups) {
@@ -554,7 +625,7 @@ foreach ($tenant in $tenants) {
         Write-Warning "Failed to process tenant $tenantId. $($_.Exception.Message)"
     }
     finally {
-        Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+        # Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
     }
 }
 
@@ -570,6 +641,20 @@ if ($retrieveUsers) {
 }
 else {
     Write-Host "User export skipped (not requested)." -ForegroundColor Yellow
+}
+
+if ($retrieveUserAuthMethods) {
+    if ($userAuthMethodResults.Count -gt 0) {
+        $authMethodsExportPath = Join-Path $OutputDirectory "AllTenants-UserAuthenticationMethods.csv"
+        $userAuthMethodResults | Export-Csv -Path $authMethodsExportPath -NoTypeInformation
+        Write-Host "User authentication methods export written to $authMethodsExportPath" -ForegroundColor Green
+    }
+    else {
+        Write-Host "No user authentication method data collected." -ForegroundColor Yellow
+    }
+}
+else {
+    Write-Host "User authentication methods export skipped (not requested)." -ForegroundColor Yellow
 }
 
 if ($retrieveGroups) {
